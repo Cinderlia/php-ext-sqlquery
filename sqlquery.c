@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <sys/stat.h>
 
@@ -46,6 +47,8 @@ typedef struct {
 	char *file;
 	char *file_real;
 	char *output_path;
+	char *origin_sql;
+	size_t origin_sql_len;
 	zend_long line;
 } sqlq_config;
 
@@ -57,6 +60,9 @@ typedef struct {
 	bool selected;
 	bool executed;
 	bool is_ps;
+	bool query_stack_match;
+	bool matched_at_origin;
+	bool matched_at_fetch;
 
 	double execute_ms;
 	double fetch_ms;
@@ -202,6 +208,53 @@ static bool sqlq_frame_matches(void)
 		ex = ex->prev_execute_data;
 	}
 	return false;
+}
+
+static bool sqlq_origin_matches(const char *sql, size_t len)
+{
+	size_t i = 0, j = 0;
+
+	if (cfg.origin_sql == NULL || cfg.origin_sql_len == 0) {
+		return false;
+	}
+	while (i < cfg.origin_sql_len) {
+		while (i < cfg.origin_sql_len && isspace((unsigned char)cfg.origin_sql[i])) {
+			i++;
+		}
+		if (i >= cfg.origin_sql_len) {
+			break;
+		}
+		while (j < len && isspace((unsigned char)sql[j])) {
+			j++;
+		}
+		if (j >= len) {
+			return false;
+		}
+		if (tolower((unsigned char)cfg.origin_sql[i]) != tolower((unsigned char)sql[j])) {
+			return false;
+		}
+		i++;
+		j++;
+	}
+	return true;
+}
+
+static bool sqlq_query_selected(const char *sql, size_t len, bool prepared_match,
+		bool *stack_match, bool *origin_match)
+{
+	bool sm = sqlq_frame_matches();
+	bool om = sqlq_origin_matches(sql, len);
+
+	if (stack_match != NULL) {
+		*stack_match = sm;
+	}
+	if (origin_match != NULL) {
+		*origin_match = om;
+	}
+	if (cfg.origin_sql != NULL) {
+		return om;
+	}
+	return prepared_match || sm;
 }
 
 static bool sqlq_prepare_site_matches(void)
@@ -379,6 +432,197 @@ static zval *sqlq_array_find(zval *array, const char *key, size_t key_len)
 	return zend_hash_str_find(Z_ARRVAL_P(array), key, key_len);
 }
 
+static bool sqlq_has_word(const char *s, size_t len, const char *word)
+{
+	size_t wl = strlen(word);
+	size_t i;
+
+	for (i = 0; i + wl <= len; i++) {
+		bool left_ok = (i == 0) || !(isalnum((unsigned char)s[i - 1]) || s[i - 1] == '_');
+		bool right_ok = (i + wl == len) || !(isalnum((unsigned char)s[i + wl]) || s[i + wl] == '_');
+		if (left_ok && right_ok && strncasecmp(s + i, word, wl) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool sqlq_starts_with_sql_keyword(const char *s, size_t len)
+{
+	static const char *keywords[] = { "SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE" };
+	size_t i;
+
+	while (len > 0 && isspace((unsigned char)*s)) {
+		s++;
+		len--;
+	}
+	for (i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+		size_t wl = strlen(keywords[i]);
+		if (len >= wl && strncasecmp(s, keywords[i], wl) == 0) {
+			if (len == wl || !(isalnum((unsigned char)s[wl]) || s[wl] == '_')) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static char *sqlq_extract_sql_literal(const char *s, size_t len, size_t *out_len)
+{
+	size_t i = 0;
+
+	while (i < len) {
+		char quote;
+		size_t j;
+		bool has_dollar = false;
+		bool closed = false;
+		smart_str buf = {0};
+
+		if (s[i] != '\'' && s[i] != '"') {
+			i++;
+			continue;
+		}
+		quote = s[i];
+		j = i + 1;
+		while (j < len) {
+			char c = s[j];
+			if (c == '\\' && j + 1 < len) {
+				j++;
+				smart_str_appendc(&buf, s[j]);
+				j++;
+				continue;
+			}
+			if (c == quote) {
+				if (j + 1 < len && s[j + 1] == quote) {
+					smart_str_appendc(&buf, quote);
+					j += 2;
+					continue;
+				}
+				closed = true;
+				j++;
+				break;
+			}
+			if (quote == '"' && c == '$') {
+				has_dollar = true;
+			}
+			smart_str_appendc(&buf, c);
+			j++;
+		}
+		i = j;
+
+		if (!closed || has_dollar) {
+			smart_str_free(&buf);
+			continue;
+		}
+		smart_str_0(&buf);
+		if (buf.s != NULL) {
+			const char *lit = ZSTR_VAL(buf.s);
+			size_t lit_len = ZSTR_LEN(buf.s);
+			size_t a = 0, b = lit_len, end;
+
+			while (a < b && isspace((unsigned char)lit[a])) {
+				a++;
+			}
+			while (b > a && isspace((unsigned char)lit[b - 1])) {
+				b--;
+			}
+			if (b > a && sqlq_starts_with_sql_keyword(lit + a, b - a)) {
+				end = a;
+				while (end < b) {
+					if (lit[end] == '?') {
+						break;
+					}
+					if (lit[end] == ':' && end + 1 < b &&
+							(isalpha((unsigned char)lit[end + 1]) || lit[end + 1] == '_')) {
+						break;
+					}
+					end++;
+				}
+				while (end > a && isspace((unsigned char)lit[end - 1])) {
+					end--;
+				}
+				if (end > a + 7) {
+					char *out = estrndup(lit + a, end - a);
+					*out_len = end - a;
+					smart_str_free(&buf);
+					return out;
+				}
+			}
+		}
+		smart_str_free(&buf);
+	}
+	return NULL;
+}
+
+static void sqlq_load_origin_sql(void)
+{
+	char *data = NULL;
+	size_t len = 0;
+	size_t *starts = NULL;
+	size_t *ends = NULL;
+	size_t nlines = 1;
+	size_t line = 0;
+	size_t start = 0;
+	size_t i;
+	zend_long target, min, idx;
+
+	if (cfg.file == NULL || cfg.line <= 0) {
+		return;
+	}
+	if (!sqlq_read_file(cfg.file, &data, &len)) {
+		return;
+	}
+	for (i = 0; i < len; i++) {
+		if (data[i] == '\n') {
+			nlines++;
+		}
+	}
+	starts = emalloc(nlines * sizeof(size_t));
+	ends = emalloc(nlines * sizeof(size_t));
+	for (i = 0; i <= len; i++) {
+		if (i == len || data[i] == '\n') {
+			starts[line] = start;
+			ends[line] = i;
+			line++;
+			start = i + 1;
+		}
+	}
+	if ((size_t)cfg.line > line) {
+		goto done;
+	}
+
+	target = (zend_long)cfg.line - 1;
+	min = target > 200 ? target - 200 : 0;
+	for (idx = target; idx >= min; idx--) {
+		size_t idx_u = (size_t)idx;
+		size_t lstart = starts[idx_u];
+		size_t lend = ends[idx_u];
+		char *lit;
+		size_t lit_len = 0;
+
+		if (idx != target &&
+				(sqlq_has_word(data + lstart, lend - lstart, "function") ||
+				 sqlq_has_word(data + lstart, lend - lstart, "class"))) {
+			break;
+		}
+		lit = sqlq_extract_sql_literal(data + lstart, lend - lstart, &lit_len);
+		if (lit != NULL) {
+			cfg.origin_sql = lit;
+			cfg.origin_sql_len = lit_len;
+			break;
+		}
+	}
+
+done:
+	if (starts != NULL) {
+		efree(starts);
+	}
+	if (ends != NULL) {
+		efree(ends);
+	}
+	efree(data);
+}
+
 static void sqlq_reset_config(void)
 {
 	if (cfg.file != NULL) {
@@ -389,6 +633,9 @@ static void sqlq_reset_config(void)
 	}
 	if (cfg.output_path != NULL) {
 		efree(cfg.output_path);
+	}
+	if (cfg.origin_sql != NULL) {
+		efree(cfg.origin_sql);
 	}
 	memset(&cfg, 0, sizeof(cfg));
 }
@@ -508,6 +755,7 @@ static bool sqlq_load_config(void)
 	if (mkdir(SQLQ_OUTPUT_DIR, 0777) != 0 && errno != EEXIST) {
 		/* Nothing to do: writing will simply fail later. */
 	}
+	sqlq_load_origin_sql();
 	return true;
 }
 /* }}} */
@@ -1151,6 +1399,8 @@ static void sqlq_add_ctx_to_queries(zval *queries, sqlq_ctx *ctx, uint32_t call_
 	add_assoc_stringl(&q, "sql", ctx->sql != NULL ? ctx->sql : "", ctx->sql_len);
 	add_assoc_string(&q, "kind", ctx->is_ps ? "prepared" : "query");
 	add_assoc_bool(&q, "matched_at_prepare", ctx->prepared_match);
+	add_assoc_bool(&q, "matched_at_origin", ctx->matched_at_origin);
+	add_assoc_bool(&q, "matched_at_fetch", ctx->matched_at_fetch);
 	add_assoc_long(&q, "row_count", (zend_long)ctx->row_count);
 	if (ctx->has_affected_rows) {
 		add_assoc_long(&q, "affected_rows", (zend_long)ctx->affected_rows);
@@ -1183,7 +1433,7 @@ static void sqlq_add_ctx_to_queries(zval *queries, sqlq_ctx *ctx, uint32_t call_
 	add_next_index_zval(queries, &q);
 }
 
-static void sqlq_flush_output(void)
+static uint32_t sqlq_flush_output(void)
 {
 	zval root;
 	zval queries;
@@ -1197,15 +1447,18 @@ static void sqlq_flush_output(void)
 	array_init(&queries);
 
 	ZEND_HASH_MAP_FOREACH_VAL(&sqlq_records, zv) {
-		index++;
-		sqlq_add_ctx_to_queries(&queries, (sqlq_ctx *)Z_PTR_P(zv), index);
+		sqlq_ctx *ctx = (sqlq_ctx *)Z_PTR_P(zv);
+		if (ctx != NULL && ctx->selected && ctx->executed) {
+			index++;
+			sqlq_add_ctx_to_queries(&queries, ctx, index);
+		}
 	} ZEND_HASH_FOREACH_END();
 
 	count = zend_hash_num_elements(Z_ARRVAL(queries));
 	if (count == 0) {
 		zval_ptr_dtor(&queries);
 		zval_ptr_dtor(&root);
-		return;
+		return 0;
 	}
 
 	add_assoc_string(&root, "target_file", cfg.file != NULL ? cfg.file : "");
@@ -1226,6 +1479,45 @@ static void sqlq_flush_output(void)
 
 	smart_str_free(&encoded);
 	zval_ptr_dtor(&root);
+	return count;
+}
+
+static void sqlq_write_debug(uint32_t matched)
+{
+	FILE *fp;
+	zval *zv;
+	uint32_t i = 0;
+
+	if (!cfg.active || cfg.output_path == NULL) {
+		return;
+	}
+	fp = fopen("/tmp/sql/sqlquery_debug.log", "wb");
+	if (fp == NULL) {
+		return;
+	}
+	fprintf(fp, "target_file=%s\n", cfg.file != NULL ? cfg.file : "");
+	fprintf(fp, "target_line=%ld\n", (long)cfg.line);
+	fprintf(fp, "output=%s\n", cfg.output_path);
+	fprintf(fp, "matched_queries=%u\n", matched);
+	if (matched == 0) {
+		fprintf(fp, "result=no matching query executed in this request\n");
+	} else {
+		ZEND_HASH_MAP_FOREACH_VAL(&sqlq_records, zv) {
+			sqlq_ctx *ctx = (sqlq_ctx *)Z_PTR_P(zv);
+			if (ctx == NULL || !ctx->selected || !ctx->executed) {
+				continue;
+			}
+			i++;
+			fprintf(fp, "[%u] kind=%s rows=%llu", i,
+				ctx->is_ps ? "prepared" : "query",
+				(unsigned long long)ctx->row_count);
+			if (ctx->has_affected_rows) {
+				fprintf(fp, " affected_rows=%lld", (long long)ctx->affected_rows);
+			}
+			fprintf(fp, " sql=%.300s\n", ctx->sql != NULL ? ctx->sql : "");
+		} ZEND_HASH_FOREACH_END();
+	}
+	fclose(fp);
 }
 /* }}} */
 
@@ -1270,6 +1562,10 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 	zend_hrtime_t start;
 	bool prepared_match;
 	bool selected;
+	bool stack_match = false;
+	bool origin_match = false;
+	const char *sql_text;
+	size_t sql_text_len;
 
 	if (sqlq_request_active && s != NULL && s->data != NULL) {
 		key = (zend_ulong)(uintptr_t)s->data;
@@ -1291,19 +1587,17 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 	}
 
 	prepared_match = state != NULL ? state->prepared_match : false;
-	selected = prepared_match || sqlq_frame_matches();
-	if (!selected) {
-		if (zend_hash_index_exists(&sqlq_stmt_current, key)) {
-			zend_hash_index_del(&sqlq_stmt_current, key);
-		}
-		return ret;
-	}
+	sql_text = state != NULL ? state->sql : "";
+	sql_text_len = state != NULL ? state->sql_len : 0;
+	selected = sqlq_query_selected(sql_text, sql_text_len, prepared_match,
+		&stack_match, &origin_match);
 
-	ctx = sqlq_ctx_new(state != NULL ? state->sql : NULL,
-		state != NULL ? state->sql_len : 0);
+	ctx = sqlq_ctx_new(sql_text, sql_text_len);
 	ctx->is_ps = true;
 	ctx->prepared_match = prepared_match;
-	ctx->selected = true;
+	ctx->selected = selected;
+	ctx->query_stack_match = stack_match;
+	ctx->matched_at_origin = origin_match;
 	ctx->executed = true;
 	ctx->execute_ms = sqlq_ns_to_ms(zend_hrtime() - start);
 
@@ -1326,9 +1620,11 @@ static enum_func_status sqlq_stmt_execute(MYSQLND_STMT *const s)
 static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *const query, const size_t query_len)
 {
 	enum_func_status ret;
-	bool matched;
 	bool matched_by_frame;
 	bool matched_by_prepare;
+	bool selected;
+	bool stack_match = false;
+	bool origin_match = false;
 	zend_hrtime_t start;
 	sqlq_ctx *ctx;
 	zend_ulong key;
@@ -1340,11 +1636,12 @@ static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *con
 	key = (zend_ulong)(uintptr_t)conn;
 	matched_by_frame = sqlq_frame_matches();
 	matched_by_prepare = !matched_by_frame && sqlq_prepare_site_matches();
-	matched = matched_by_frame || matched_by_prepare;
+	selected = sqlq_query_selected(query, query_len, matched_by_prepare,
+		&stack_match, &origin_match);
 
 	start = zend_hrtime();
 	ret = sqlq_orig_conn_methods.query(conn, query, query_len);
-	if (!matched || ret != PASS) {
+	if (ret != PASS) {
 		if (zend_hash_index_exists(&sqlq_conn_current, key)) {
 			zend_hash_index_del(&sqlq_conn_current, key);
 		}
@@ -1354,7 +1651,9 @@ static enum_func_status sqlq_conn_query(MYSQLND_CONN_DATA *conn, const char *con
 	ctx = sqlq_ctx_new(query, query_len);
 	ctx->is_ps = false;
 	ctx->prepared_match = matched_by_prepare;
-	ctx->selected = true;
+	ctx->selected = selected;
+	ctx->query_stack_match = stack_match;
+	ctx->matched_at_origin = origin_match;
 	ctx->executed = true;
 	ctx->execute_ms = sqlq_ns_to_ms(zend_hrtime() - start);
 
@@ -1391,12 +1690,20 @@ static enum_func_status sqlq_res_fetch_row(MYSQLND_RES *result, zval **row_ptr,
 		} else if (result->conn != NULL) {
 			ctx = zend_hash_index_find_ptr(&sqlq_conn_current, (zend_ulong)(uintptr_t)result->conn);
 		}
-		if (ctx != NULL && (!ctx->selected || !ctx->executed)) {
+		if (ctx != NULL && !ctx->executed) {
 			ctx = NULL;
 		}
 		if (ctx != NULL) {
-			start = zend_hrtime();
-			timed = true;
+			if (!ctx->selected && !ctx->query_stack_match && sqlq_frame_matches()) {
+				ctx->selected = true;
+				ctx->matched_at_fetch = true;
+			}
+			if (ctx->selected) {
+				start = zend_hrtime();
+				timed = true;
+			} else {
+				ctx = NULL;
+			}
 		}
 	}
 
@@ -1601,7 +1908,8 @@ static PHP_RSHUTDOWN_FUNCTION(sqlquery)
 	(void)module_number;
 
 	if (sqlq_request_active) {
-		sqlq_flush_output();
+		uint32_t matched = sqlq_flush_output();
+		sqlq_write_debug(matched);
 		zend_hash_destroy(&sqlq_stmt_current);
 		zend_hash_destroy(&sqlq_conn_current);
 		zend_hash_destroy(&sqlq_ps_states);
